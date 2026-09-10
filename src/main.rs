@@ -15,11 +15,14 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Layout},
-    style::{Style, Stylize},
+    layout::{Alignment, Constraint, Layout, Margin, Rect},
+    style::Style,
     symbols::border,
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
 };
 use throbber_widgets_tui::{BRAILLE_EIGHT_DOUBLE, Throbber, ThrobberState};
 use tokio::runtime::Handle;
@@ -28,6 +31,8 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use tui::source::{self, Book, Format, SearchResults, Source};
+
+mod theme;
 
 const DOWNLOAD_DIR: &str = "downloads";
 const TICK: Duration = Duration::from_millis(80);
@@ -74,6 +79,8 @@ struct Entry {
     book: Book,
     marked: bool,
     status: Status,
+    /// When the download was queued, for the rate and ETA readouts.
+    started: Option<Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -118,6 +125,8 @@ struct App {
     generation: u64,
     pending: usize,
     spinner: ThrobberState,
+    /// Animation tick, bumped once per frame; drives the indeterminate bar.
+    frame: u64,
     status: String,
     library: Vec<LibraryEntry>,
     library_selected: usize,
@@ -153,6 +162,7 @@ impl App {
             generation: 0,
             pending: 0,
             spinner: ThrobberState::default(),
+            frame: 0,
             status: "type a title or author, then press Enter".to_string(),
             library: Vec::new(),
             library_selected: 0,
@@ -175,6 +185,7 @@ impl App {
 
             if last.elapsed() >= TICK {
                 self.spinner.calc_next();
+                self.frame = self.frame.wrapping_add(1);
                 last = Instant::now();
             }
         }
@@ -452,6 +463,7 @@ impl App {
         let started = jobs.len();
         for (idx, book, download, src) in jobs {
             self.entries[idx].status = Status::Queued;
+            self.entries[idx].started = Some(Instant::now());
             let client = self.client.clone();
             let tx = self.tx.clone();
             self.rt.spawn(async move {
@@ -511,6 +523,7 @@ impl App {
                                     book,
                                     marked: false,
                                     status: Status::Idle,
+                                    started: None,
                                 }));
                         }
                         Err(error) => self.status = format!("{source}: {error}"),
@@ -593,111 +606,208 @@ impl App {
             Constraint::Min(0),
         ])
         .areas(frame.area());
-        self.draw_tabs(frame, tabs_area, false);
 
-        // -- search box, with the real terminal cursor inside it
+        self.draw_tabs(frame, tabs_area, false);
+        self.draw_search_box(frame, search_area);
+        self.draw_sources(frame, sources_area);
+        self.draw_status(frame, status_area);
+        self.draw_results(frame, list_area);
+    }
+
+    /// The query box, with the real terminal cursor parked inside it.
+    fn draw_search_box(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.mode == Mode::Search;
+        let accent = if focused { theme::ACCENT } else { theme::FAINT };
         let block = Block::bordered()
-            .title(" Search ")
             .border_set(border::ROUNDED)
-            .border_style(if focused {
-                Style::new().cyan()
-            } else {
-                Style::new().dark_gray()
-            });
-        let inner = block.inner(search_area);
+            .border_style(Style::new().fg(accent))
+            .title(Span::styled(" Search ", Style::new().fg(accent).bold()));
+        let inner = block.inner(area);
         let width = inner.width.max(1) as usize;
         let scroll = self.input.visual_scroll(width.saturating_sub(1));
-        frame.render_widget(
-            Paragraph::new(self.input.value())
-                .scroll((0, scroll as u16))
-                .block(block),
-            search_area,
-        );
+
+        // An empty, unfocused box says what to do with it rather than sitting blank.
+        let body = match self.input.value().is_empty() && !focused {
+            true => Paragraph::new(Span::styled(
+                "  press / to search",
+                Style::new().fg(theme::FAINT),
+            )),
+            false => Paragraph::new(self.input.value()).scroll((0, scroll as u16)),
+        };
+        frame.render_widget(body.block(block), area);
+
         if focused {
             let x = self.input.visual_cursor().saturating_sub(scroll) as u16;
             frame.set_cursor_position((inner.x + x, inner.y));
         }
+    }
 
-        // -- source checkboxes: which catalogs get queried
+    /// One chip per catalog, lit when it will be queried.
+    fn draw_sources(&self, frame: &mut Frame, area: Rect) {
         let picking = self.mode == Mode::Sources;
-        let mut chips: Vec<Span> = vec!["Sources ".dark_gray()];
+        let mut chips: Vec<Span> = vec![Span::styled("Sources", Style::new().fg(theme::MUTED))];
         for (i, entry) in self.sources.iter().enumerate() {
             let text = format!(
-                "{}{} ",
-                if entry.enabled { "[x] " } else { "[ ] " },
+                " {} {} ",
+                if entry.enabled { "●" } else { "○" },
                 entry.source.name()
             );
             chips.push(match (picking && i == self.source_cursor, entry.enabled) {
-                (true, _) => text.black().on_cyan(),
-                (false, true) => text.green(),
-                (false, false) => text.dark_gray(),
+                (true, _) => Span::styled(
+                    text,
+                    Style::new()
+                        .fg(theme::ON_ACCENT)
+                        .bg(theme::ACCENT_BRIGHT)
+                        .bold(),
+                ),
+                (false, true) => Span::styled(text, Style::new().fg(theme::OK)),
+                (false, false) => Span::styled(text, Style::new().fg(theme::FAINT)),
             });
         }
-        chips.push(
-            if picking {
-                " Space toggles, Esc done"
-            } else if self.mode == Mode::Search {
-                " (Ctrl+S/F2 to change)"
-            } else {
-                " (s to change)"
-            }
-            .dark_gray(),
-        );
-        frame.render_widget(Paragraph::new(Line::from(chips)), sources_area);
+        chips.push(theme::hint(if picking {
+            "  space toggles, esc done"
+        } else if self.mode == Mode::Search {
+            "  (ctrl+s to change)"
+        } else {
+            "  (s to change)"
+        }));
+        frame.render_widget(Paragraph::new(Line::from(chips)), area);
+    }
 
-        // -- status line, with a spinner while any source is still in flight
+    /// Spinner plus whatever the app is waiting on, then the free-text status.
+    fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let mut spans: Vec<Span> = Vec::new();
         if let Some(phase) = self.phase() {
-            spans.push(self.spin(Style::new().cyan().bold()));
-            spans.push(phase.cyan().bold());
-            spans.push("  ".into());
+            spans.push(self.spin(Style::new().fg(theme::ACCENT).bold()));
+            spans.push(Span::styled(
+                format!(" {phase}"),
+                Style::new().fg(theme::ACCENT).bold(),
+            ));
+            spans.push(Span::raw("   "));
         }
-        spans.push(self.status.clone().dark_gray());
-        frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
+        spans.push(Span::styled(
+            self.status.clone(),
+            Style::new().fg(theme::MUTED),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
 
-        // -- results
+    fn draw_results(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_set(border::ROUNDED)
+            .border_style(Style::new().fg(theme::FAINT))
+            .title(Span::styled(
+                " Results ",
+                Style::new().fg(theme::ACCENT).bold(),
+            ))
+            .title_bottom(self.results_legend().centered());
+
+        if self.entries.is_empty() {
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let lines = match self.pending > 0 {
+                true => vec![Line::from(Span::styled(
+                    "Searching the catalogs…",
+                    Style::new().fg(theme::MUTED),
+                ))],
+                false => vec![
+                    Line::from(Span::styled(
+                        "Nothing here yet",
+                        Style::new().fg(theme::MUTED).bold(),
+                    )),
+                    Line::from(""),
+                    Line::from(theme::hint("Results from the ticked sources land here")),
+                ],
+            };
+            self.draw_placeholder(frame, inner, lines);
+            return;
+        }
+
+        // Two cells go to the cursor gutter, two to the borders.
+        let content_width = area.width.saturating_sub(4) as usize;
         let items: Vec<ListItem> = self
             .entries
             .iter()
-            .map(|e| ListItem::new(self.row(e)))
+            .map(|entry| ListItem::new(self.row(entry, content_width)))
             .collect();
         let list = List::new(items)
-            .block(
-                Block::bordered()
-                    .title(Line::from(" Results ".bold()).centered())
-                    .title_bottom(
-                        Line::from(vec![
-                            " Search ".into(),
-                            "</>".blue().bold(),
-                            " Mark ".into(),
-                            "<Space>".blue().bold(),
-                            " Download ".into(),
-                            "<D>".blue().bold(),
-                            " Open ".into(),
-                            "<O>".blue().bold(),
-                            " Quit ".into(),
-                            "<Q> ".blue().bold(),
-                            format!(
-                                " Page {}{} ",
-                                self.page,
-                                self.total_pages
-                                    .map(|total| format!("/{total}"))
-                                    .unwrap_or_default()
-                            )
-                            .into(),
-                            "[p previous] ".blue().bold(),
-                            "[n next] ".blue().bold(),
-                        ])
-                        .centered(),
-                    )
-                    .border_set(border::THICK),
-            )
-            .highlight_symbol("> ")
-            .highlight_style(Style::new().bold());
-        let mut state =
-            ListState::default().with_selected((!self.entries.is_empty()).then_some(self.selected));
-        frame.render_stateful_widget(list, list_area, &mut state);
+            .block(block)
+            .highlight_symbol(theme::CURSOR)
+            .highlight_style(Style::new().bg(theme::SELECTION_BG).bold());
+        let mut state = ListState::default().with_selected(Some(self.selected));
+        frame.render_stateful_widget(list, area, &mut state);
+
+        self.draw_scrollbar(frame, area, self.entries.len(), self.selected);
+    }
+
+    /// A slim scrollbar down the right edge, only once the list overflows.
+    fn draw_scrollbar(&self, frame: &mut Frame, area: Rect, len: usize, position: usize) {
+        let visible = area.height.saturating_sub(2) as usize;
+        if len <= visible {
+            return;
+        }
+        let mut state = ScrollbarState::new(len).position(position);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(Style::new().fg(theme::FAINT))
+                .thumb_style(Style::new().fg(theme::ACCENT)),
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut state,
+        );
+    }
+
+    /// Centre a short message in an otherwise empty list body.
+    fn draw_placeholder(&self, frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+        if area.height == 0 {
+            return;
+        }
+        let top = area.height.saturating_sub(lines.len() as u16) / 2;
+        let area = Rect {
+            y: area.y + top,
+            height: area.height - top,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+    }
+
+    fn results_legend(&self) -> Line<'static> {
+        let page = format!(
+            " {}{} ",
+            self.page,
+            self.total_pages
+                .map(|total| format!("/{total}"))
+                .unwrap_or_default()
+        );
+        Line::from(vec![
+            theme::hint(" search "),
+            theme::key("/"),
+            theme::hint("  mark "),
+            theme::key("space"),
+            theme::hint("  get "),
+            theme::key("d"),
+            theme::hint("  open "),
+            theme::key("o"),
+            theme::hint("  quit "),
+            theme::key("q"),
+            theme::hint("   page"),
+            Span::styled(page, Style::new().fg(theme::ACCENT_BRIGHT).bold()),
+            theme::key("p"),
+            theme::hint("/"),
+            theme::key("n"),
+            theme::hint(" "),
+        ])
     }
 
     /// One frame of the braille spinner, styled.
@@ -712,8 +822,8 @@ impl App {
     fn phase(&self) -> Option<String> {
         if self.pending > 0 {
             return Some(match self.entries.is_empty() {
-                true => "Searching...".to_string(),
-                false => "Waiting for the response...".to_string(),
+                true => "Searching".to_string(),
+                false => "Waiting for the rest".to_string(),
             });
         }
         let active = self
@@ -722,30 +832,48 @@ impl App {
             .filter(|e| matches!(e.status, Status::Queued | Status::Downloading { .. }))
             .count();
         (active > 0).then(|| match active {
-            1 => "Downloading...".to_string(),
-            n => format!("Downloading {n} books..."),
+            1 => "Downloading".to_string(),
+            n => format!("Downloading {n} books"),
         })
     }
 
-    fn draw_tabs(&self, frame: &mut Frame, area: ratatui::layout::Rect, library: bool) {
-        let search = if library {
-            " Search ".dark_gray()
-        } else {
-            " Search ".black().on_cyan().bold()
-        };
-        let downloads = if library {
-            " Downloads ".black().on_cyan().bold()
-        } else {
-            " Downloads ".dark_gray()
+    /// Widest catalog name, so every title starts at the same column.
+    fn tag_width(&self) -> usize {
+        self.sources
+            .iter()
+            .map(|entry| entry.source.name().len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn draw_tabs(&self, frame: &mut Frame, area: Rect, library: bool) {
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(16)]).areas(area);
+
+        let tab = |label: &str, active: bool| match active {
+            true => Span::styled(
+                format!(" {label} "),
+                Style::new().fg(theme::ON_ACCENT).bg(theme::ACCENT).bold(),
+            ),
+            false => Span::styled(format!(" {label} "), Style::new().fg(theme::MUTED)),
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                search,
-                "  ".into(),
-                downloads,
-                "    <Tab> switch".dark_gray(),
+                tab("Search", !library),
+                Span::raw(" "),
+                tab("Downloads", library),
+                theme::hint("   tab switches"),
             ])),
-            area,
+            left_area,
+        );
+
+        let count = match library {
+            true => format!("{} on disk ", self.library.len()),
+            false => format!("{} found ", self.entries.len()),
+        };
+        frame.render_widget(
+            Paragraph::new(theme::hint(&count)).alignment(Alignment::Right),
+            right_area,
         );
     }
 
@@ -757,60 +885,135 @@ impl App {
         ])
         .areas(frame.area());
         self.draw_tabs(frame, tabs_area, true);
-        frame.render_widget(Paragraph::new(self.status.clone().dark_gray()), status_area);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                self.status.clone(),
+                Style::new().fg(theme::MUTED),
+            )),
+            status_area,
+        );
 
-        let items = self.library.iter().map(|entry| {
-            let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
-            let extension = entry
-                .path
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("?")
-                .to_ascii_uppercase();
-            ListItem::new(Line::from(vec![
-                name.into_owned().into(),
-                format!("  [{extension}] ").blue(),
-                human_size(entry.size).dark_gray(),
-            ]))
-        });
+        let block = Block::bordered()
+            .border_set(border::ROUNDED)
+            .border_style(Style::new().fg(theme::FAINT))
+            .title(Span::styled(
+                " Downloaded books ",
+                Style::new().fg(theme::ACCENT).bold(),
+            ))
+            .title_bottom(
+                Line::from(vec![
+                    theme::hint(" open "),
+                    theme::key("enter"),
+                    theme::hint("  refresh "),
+                    theme::key("r"),
+                    theme::hint("  search "),
+                    theme::key("tab"),
+                    theme::hint(" "),
+                ])
+                .centered(),
+            );
+
+        if self.library.is_empty() {
+            let inner = block.inner(list_area);
+            frame.render_widget(block, list_area);
+            self.draw_placeholder(
+                frame,
+                inner,
+                vec![
+                    Line::from(Span::styled(
+                        "No books downloaded yet",
+                        Style::new().fg(theme::MUTED).bold(),
+                    )),
+                    Line::from(""),
+                    Line::from(theme::hint("Find one on the Search tab and press d")),
+                ],
+            );
+            return;
+        }
+
+        let content_width = list_area.width.saturating_sub(4) as usize;
+        let items: Vec<ListItem> = self
+            .library
+            .iter()
+            .map(|entry| ListItem::new(Self::library_row(entry, content_width)))
+            .collect();
         let list = List::new(items)
-            .block(
-                Block::bordered()
-                    .title(Line::from(" Downloaded books ".bold()).centered())
-                    .title_bottom(
-                        Line::from(vec![
-                            " Open ".into(),
-                            "<Enter/O>".blue().bold(),
-                            " Refresh ".into(),
-                            "<R>".blue().bold(),
-                            " Search ".into(),
-                            "<Tab> ".blue().bold(),
-                        ])
-                        .centered(),
-                    )
-                    .border_set(border::THICK),
-            )
-            .highlight_symbol("> ")
-            .highlight_style(Style::new().bold());
-        let mut state = ListState::default()
-            .with_selected((!self.library.is_empty()).then_some(self.library_selected));
+            .block(block)
+            .highlight_symbol(theme::CURSOR)
+            .highlight_style(Style::new().bg(theme::SELECTION_BG).bold());
+        let mut state = ListState::default().with_selected(Some(self.library_selected));
         frame.render_stateful_widget(list, list_area, &mut state);
+
+        self.draw_scrollbar(frame, list_area, self.library.len(), self.library_selected);
     }
 
-    fn row<'a>(&self, entry: &'a Entry) -> Line<'a> {
-        let mut spans = vec![
-            if entry.marked {
-                "[x] ".green()
-            } else {
-                "[ ] ".into()
+    /// Filename on the left, format and size lined up on the right.
+    fn library_row(entry: &LibraryEntry, width: usize) -> Line<'static> {
+        let name = entry
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let extension = entry
+            .path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("?")
+            .to_ascii_uppercase();
+
+        let right = vec![
+            Span::styled(format!("[{extension}]"), Style::new().fg(theme::BLUE)),
+            Span::styled(
+                format!("  {:>9}", human_size(entry.size)),
+                Style::new().fg(theme::MUTED),
+            ),
+        ];
+        Self::justify(vec![Span::raw(name)], right, width)
+    }
+
+    /// A result row: mark, catalog, title and author left; live status right.
+    fn row(&self, entry: &Entry, width: usize) -> Line<'static> {
+        let mut left: Vec<Span> = vec![
+            match entry.marked {
+                true => Span::styled("✓ ", Style::new().fg(theme::OK).bold()),
+                false => Span::styled("· ", Style::new().fg(theme::FAINT)),
             },
-            format!("[{}] ", entry.book.source).yellow().bold(),
-            entry.book.title.as_str().into(),
-            format!("  {}", entry.book.author_line()).dark_gray(),
+            Span::styled(
+                format!("{:<width$}  ", entry.book.source, width = self.tag_width()),
+                Style::new().fg(theme::VIOLET),
+            ),
+            Span::raw(entry.book.title.clone()),
+            Span::styled(
+                format!("  {}", entry.book.author_line()),
+                Style::new().fg(theme::MUTED),
+            ),
         ];
         if let Some(language) = &entry.book.language {
-            spans.push(format!("  {language}").magenta());
+            left.push(Span::styled(
+                format!("  {language}"),
+                Style::new().fg(theme::BLUE),
+            ));
         }
+        Self::justify(left, self.status_cell(entry), width)
+    }
+
+    /// Push `right` against the right edge, clipping `left` if the two collide.
+    fn justify(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+        let right_width: usize = right.iter().map(|span| span.width()).sum();
+        let mut spans = theme::clip(left, width.saturating_sub(right_width + 2));
+        let used: usize = spans.iter().map(|span| span.width()).sum();
+        spans.push(Span::raw(
+            " ".repeat(width.saturating_sub(used + right_width)),
+        ));
+        spans.extend(right);
+        Line::from(spans)
+    }
+
+    /// The right-hand column of a result row: available formats, or live progress.
+    fn status_cell(&self, entry: &Entry) -> Vec<Span<'static>> {
+        /// Cells given to the progress bar itself.
+        const BAR: usize = 14;
 
         match &entry.status {
             Status::Idle => {
@@ -825,42 +1028,68 @@ impl App {
                         }
                         seen.push(download.format.clone());
                         Some(match download.size {
-                            Some(size) => {
-                                format!("{} {}", download.format, human_size(size))
-                            }
+                            Some(size) => format!("{} {}", download.format, human_size(size)),
                             None => download.format.to_string(),
                         })
                     })
                     .collect::<Vec<_>>();
-                spans.push(format!("  [{}]", formats.join(",")).blue());
+                vec![Span::styled(
+                    formats.join("  "),
+                    Style::new().fg(theme::BLUE),
+                )]
             }
-            Status::Queued => {
-                spans.push("  ".into());
-                spans.push(self.spin(Style::new().yellow()));
-                spans.push("Waiting for the response...".yellow());
-            }
+            Status::Queued => vec![
+                self.spin(Style::new().fg(theme::WARN)),
+                Span::styled(" queued", Style::new().fg(theme::WARN)),
+            ],
             Status::Downloading { seen, total } => {
-                spans.push("  ".into());
-                spans.push(self.spin(Style::new().yellow()));
-                spans.push(
-                    match total {
-                        Some(t) if *t > 0 => format!("Downloading... {}%", seen * 100 / t),
-                        _ => format!("Downloading... {seen} B"),
+                let elapsed = entry.started.map(|at| at.elapsed()).unwrap_or_default();
+                let mut spans = Vec::new();
+                match total {
+                    // Known length: a real bar, a percentage, a rate and an ETA.
+                    Some(total) if *total > 0 => {
+                        let fraction = *seen as f64 / *total as f64;
+                        spans.extend(theme::progress_bar(fraction, BAR, theme::WARN));
+                        spans.push(Span::styled(
+                            format!(" {:>3.0}%", fraction * 100.0),
+                            Style::new().fg(theme::WARN).bold(),
+                        ));
+                        spans.push(Span::styled(
+                            format!("  {:>9}", theme::rate(*seen, elapsed)),
+                            Style::new().fg(theme::MUTED),
+                        ));
+                        spans.push(Span::styled(
+                            format!("  {:>5}", theme::eta(*seen, *total, elapsed)),
+                            Style::new().fg(theme::MUTED),
+                        ));
                     }
-                    .yellow(),
-                );
+                    // No Content-Length: sweep, rather than pretend to know.
+                    _ => {
+                        spans.extend(theme::pulse(self.frame, BAR, theme::WARN));
+                        spans.push(Span::styled(
+                            format!(" {:>9}", human_size(*seen)),
+                            Style::new().fg(theme::WARN).bold(),
+                        ));
+                        spans.push(Span::styled(
+                            format!("  {:>9}", theme::rate(*seen, elapsed)),
+                            Style::new().fg(theme::MUTED),
+                        ));
+                    }
+                }
+                spans
             }
-            Status::Done(path) => spans.push(
+            Status::Done(path) => vec![Span::styled(
                 format!(
-                    "  Saved {}",
+                    "✓ {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
-                )
-                .green(),
-            ),
-            Status::Failed(error) => spans.push(format!("  Failed: {error}").red()),
+                ),
+                Style::new().fg(theme::OK),
+            )],
+            Status::Failed(error) => vec![Span::styled(
+                format!("✗ {error}"),
+                Style::new().fg(theme::ERR),
+            )],
         }
-
-        Line::from(spans)
     }
 
     fn exact_total_pages(&self) -> Option<usize> {
@@ -1000,21 +1229,39 @@ mod tests {
                     seen: 94_480,
                     total: Some(188_960),
                 },
+                started: Some(Instant::now() - Duration::from_secs(3)),
             },
             Entry {
                 book: book("Through the Looking-Glass", "Carroll, Lewis"),
                 marked: true,
                 status: Status::Queued,
+                started: None,
             },
             Entry {
                 book: book("Alice's Adventures Under Ground", "Carroll, Lewis"),
                 marked: false,
                 status: Status::Done("downloads/alice.epub".into()),
+                started: None,
+            },
+            Entry {
+                book: book("The Nursery Alice", "Carroll, Lewis"),
+                marked: false,
+                status: Status::Downloading {
+                    seen: 41_233,
+                    total: None,
+                },
+                started: Some(Instant::now() - Duration::from_secs(2)),
+            },
+            Entry {
+                book: book("Sylvie and Bruno", "Carroll, Lewis"),
+                marked: false,
+                status: Status::Failed("404 Not Found".into()),
+                started: None,
             },
         ];
         app.selected = 1;
 
-        let mut term = Terminal::new(TestBackend::new(84, 13)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(110, 15)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         println!("{}", term.backend());
     }
@@ -1038,9 +1285,70 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(70, 8)).unwrap();
         term.draw(|frame| app.draw(frame)).unwrap();
         let rendered = format!("{}", term.backend());
+        println!("{}", term.backend());
         assert!(rendered.contains("Downloads"));
         assert!(rendered.contains("Marsovac.epub"));
         assert!(rendered.contains("EPUB"));
         assert!(rendered.contains("374.9 kB"));
+    }
+
+    /// Both lists have to say something useful when they have nothing to show.
+    #[test]
+    fn renders_empty_states() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = App::new(rt.handle().clone()).unwrap();
+
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = format!("{}", term.backend());
+        println!("{}", term.backend());
+        assert!(rendered.contains("Nothing here yet"));
+
+        // Once focus leaves the box, it says how to get back to it.
+        app.mode = Mode::Browse;
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = format!("{}", term.backend());
+        println!("{}", term.backend());
+        assert!(rendered.contains("press / to search"));
+
+        app.mode = Mode::Library;
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = format!("{}", term.backend());
+        println!("{}", term.backend());
+        assert!(rendered.contains("No books downloaded yet"));
+    }
+
+    /// A bar that cannot fill past its width, and reads 0% and 100% exactly.
+    #[test]
+    fn progress_bar_stays_within_its_width() {
+        for (fraction, expected_full) in [(0.0, 0), (0.5, 5), (1.0, 10)] {
+            let spans = theme::progress_bar(fraction, 10, theme::WARN);
+            let width: usize = spans.iter().map(|span| span.width()).sum();
+            assert_eq!(width, 10, "fraction {fraction} drew {width} cells");
+            assert_eq!(spans[0].content.chars().count(), expected_full);
+        }
+        // Out-of-range input is clamped rather than overflowing the row.
+        let spans = theme::progress_bar(4.2, 10, theme::WARN);
+        assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 10);
+    }
+
+    /// The sweep never runs off either end of its track.
+    #[test]
+    fn pulse_stays_within_its_width() {
+        for frame in 0..64 {
+            let spans = theme::pulse(frame, 12, theme::WARN);
+            let width: usize = spans.iter().map(|span| span.width()).sum();
+            assert_eq!(width, 12, "frame {frame} drew {width} cells");
+        }
+    }
+
+    /// The right-hand column keeps its place even when the title is too long.
+    #[test]
+    fn justify_clips_the_left_side_to_fit() {
+        let long = "a".repeat(200);
+        let line = App::justify(vec![Span::raw(long)], vec![Span::raw("100%")], 40);
+        assert_eq!(line.width(), 40);
+        assert!(line.to_string().ends_with("100%"));
+        assert!(line.to_string().contains('…'));
     }
 }

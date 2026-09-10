@@ -3052,6 +3052,7 @@ dependencies = [
  "throbber-widgets-tui",
  "tokio",
  "tui-input",
+ "unicode-width",
 ]
 
 [[package]]
