@@ -16,10 +16,13 @@ use thirtyfour::manager::BrowserKind;
 use thirtyfour::prelude::*;
 use tokio::sync::Mutex;
 
-use super::{Book, Download, Format, Progress, SearchResults, Source, http_fetch};
+use super::{
+    Book, Download, Format, Progress, SearchResults, Source, http_fetch, log_download_diagnostic,
+};
 
 const BASE_URL: &str = "https://annas-archive.gl";
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(35);
+const PARTNER_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Default)]
 pub struct AnnasArchive {
@@ -65,9 +68,7 @@ impl Source for AnnasArchive {
         dest_dir: &Path,
         progress: Progress<'_>,
     ) -> Result<PathBuf> {
-        let body = self.load_html(&download.url).await?;
-        let direct_url = direct_download_url(&body, &download.format)
-            .context("Anna's Archive did not provide a partner download URL")?;
+        let direct_url = self.resolve_download_url(book, download, dest_dir).await?;
         let direct = Download {
             format: download.format.clone(),
             url: direct_url,
@@ -80,35 +81,84 @@ impl Source for AnnasArchive {
 impl AnnasArchive {
     async fn load_html(&self, url: &str) -> Result<String> {
         let mut slot = self.driver.lock().await;
-        if slot.is_none() {
-            *slot = Some(start_driver().await?);
-        }
-
-        let driver = slot.as_ref().expect("driver initialized");
-        if let Err(error) = driver.goto(url).await {
-            // A browser process may have disappeared between searches. Rebuild
-            // it once, while retaining the same on-disk profile.
-            *slot = None;
-            let replacement = start_driver().await.context(error.to_string())?;
-            replacement.goto(url).await?;
-            *slot = Some(replacement);
-        }
-        let driver = slot.as_ref().expect("driver initialized");
-
-        let started = Instant::now();
-        loop {
-            let title = driver.title().await.unwrap_or_default();
-            if !title.contains("DDoS-Guard") && !title.contains("Just a moment") {
-                break;
-            }
-            if started.elapsed() >= CHALLENGE_TIMEOUT {
-                bail!("browser verification did not finish within 35 seconds");
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-
-        driver.source().await.context("reading Anna's Archive page")
+        navigate(&mut slot, url).await?;
+        slot.as_ref()
+            .expect("driver initialized")
+            .source()
+            .await
+            .context("reading Anna's Archive page")
     }
+
+    /// Keep the browser locked until the dynamic partner link appears. This
+    /// also prevents simultaneous downloads from navigating the shared tab
+    /// away from one another midway through partner-link resolution.
+    async fn resolve_download_url(
+        &self,
+        book: &Book,
+        download: &Download,
+        dest_dir: &Path,
+    ) -> Result<String> {
+        let mut slot = self.driver.lock().await;
+        navigate(&mut slot, &download.url).await?;
+        let driver = slot.as_ref().expect("driver initialized");
+        let started = Instant::now();
+
+        loop {
+            let body = driver
+                .source()
+                .await
+                .context("reading Anna's Archive partner page")?;
+            if let Some(url) = direct_download_url(&body, &download.format) {
+                return Ok(url);
+            }
+            if started.elapsed() >= PARTNER_TIMEOUT {
+                let title = driver.title().await.unwrap_or_default();
+                let details = format!(
+                    "Anna's Archive did not provide a partner download URL within 25 seconds; page_title={title}; html={body}"
+                );
+                return Err(log_download_diagnostic(
+                    book,
+                    dest_dir,
+                    "partner-link",
+                    &download.url,
+                    &details,
+                )
+                .await);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+async fn navigate(slot: &mut Option<WebDriver>, url: &str) -> Result<()> {
+    if slot.is_none() {
+        *slot = Some(start_driver().await?);
+    }
+
+    let driver = slot.as_ref().expect("driver initialized");
+    if let Err(error) = driver.goto(url).await {
+        // A browser process may have disappeared between searches. Rebuild
+        // it once, while retaining the same on-disk profile.
+        *slot = None;
+        let replacement = start_driver().await.context(error.to_string())?;
+        replacement.goto(url).await?;
+        *slot = Some(replacement);
+    }
+    let driver = slot.as_ref().expect("driver initialized");
+
+    let started = Instant::now();
+    loop {
+        let title = driver.title().await.unwrap_or_default();
+        if !title.contains("DDoS-Guard") && !title.contains("Just a moment") {
+            break;
+        }
+        if started.elapsed() >= CHALLENGE_TIMEOUT {
+            bail!("browser verification did not finish within 35 seconds");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    Ok(())
 }
 
 async fn start_driver() -> Result<WebDriver> {

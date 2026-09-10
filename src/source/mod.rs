@@ -301,6 +301,49 @@ pub(super) async fn log_http_failure(
     }
 }
 
+/// Record failures which happen before an HTTP file response exists, such as
+/// a browser page that never exposes its dynamically generated partner link.
+pub(super) async fn log_download_diagnostic(
+    book: &Book,
+    dest_dir: &Path,
+    stage: &str,
+    url: &str,
+    details: &str,
+) -> anyhow::Error {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let details = details
+        .chars()
+        .take(4096)
+        .collect::<String>()
+        .replace(['\r', '\n'], " ");
+    let record = format!(
+        "time_unix={timestamp}\nsource={}\nbook_id={}\ntitle={}\nstage={stage}\nurl={url}\ndetails={details}\n---\n",
+        book.source,
+        book.id,
+        book.title.replace(['\r', '\n'], " "),
+    );
+    let log_path = dest_dir.join("download-errors.log");
+    let logged = async {
+        tokio::fs::create_dir_all(dest_dir).await?;
+        let mut log = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await?;
+        log.write_all(record.as_bytes()).await?;
+        log.flush().await
+    }
+    .await;
+
+    match logged {
+        Ok(()) => anyhow::anyhow!("{details}; details saved to {}", log_path.display()),
+        Err(error) => anyhow::anyhow!("{details}; could not write {}: {error}", log_path.display()),
+    }
+}
+
 pub(super) fn filename(book: &Book, download: &Download) -> String {
     let title: String = book
         .title

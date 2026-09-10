@@ -15,6 +15,7 @@ use super::{Book, Download, Format, Progress, SearchResults, Source, log_http_fa
 
 const SEARCH_URL: &str = "https://libgen.li/";
 const DOWNLOAD_URL: &str = "https://libgen.li/get.php?md5=";
+const MAX_DOWNLOAD_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Default)]
 pub struct Libgen;
@@ -61,7 +62,7 @@ impl Source for Libgen {
         let path = dest_dir.join(super::filename(book, download));
         let mut request_url = download.url.clone();
 
-        for attempt in 1..=3 {
+        for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
             let response = client
                 .get(&request_url)
                 .header(reqwest::header::ACCEPT, "application/octet-stream")
@@ -73,10 +74,15 @@ impl Source for Libgen {
                 .await
                 .with_context(|| format!("GET {}", download.url))?;
             if !response.status().is_success() {
-                let retry = response.status().is_server_error() && attempt < 3;
+                let retry = response.status().is_server_error() && attempt < MAX_DOWNLOAD_ATTEMPTS;
+                let fallback_url = retry.then(|| alternate_cdn_url(response.url())).flatten();
                 let error = log_http_failure(response, book, dest_dir).await;
                 if retry {
-                    tokio::time::sleep(std::time::Duration::from_millis(300 * attempt)).await;
+                    if let Some(url) = fallback_url {
+                        request_url = url;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64))
+                        .await;
                     continue;
                 }
                 return Err(error);
@@ -97,16 +103,17 @@ impl Source for Libgen {
             if content_type.starts_with("text/html") || !attachment {
                 if let Ok(body) = response.text().await
                     && let Some(keyed_url) = keyed_download_url(&body, &book.id)
+                    && attempt < MAX_DOWNLOAD_ATTEMPTS
                 {
                     request_url = keyed_url;
                     continue;
                 }
-                if attempt < 3 {
+                if attempt < MAX_DOWNLOAD_ATTEMPTS {
                     request_url = download.url.clone();
                     continue;
                 }
                 bail!(
-                    "LibGen returned HTML instead of an ebook after 3 attempts ({response_status} from {response_url})"
+                    "LibGen returned HTML instead of an ebook after {MAX_DOWNLOAD_ATTEMPTS} attempts ({response_status} from {response_url})"
                 );
             }
 
@@ -126,7 +133,7 @@ impl Source for Libgen {
             file.flush().await?;
 
             if content_length.is_some_and(|expected| seen != expected) {
-                if attempt < 3 {
+                if attempt < MAX_DOWNLOAD_ATTEMPTS {
                     continue;
                 }
                 bail!("incomplete LibGen download: received {seen} bytes, expected {total:?}");
@@ -134,7 +141,7 @@ impl Source for Libgen {
             return Ok(path);
         }
 
-        unreachable!("the retry loop always returns or fails on its third attempt")
+        bail!("LibGen download exhausted all retry attempts")
     }
 }
 
@@ -150,6 +157,17 @@ fn keyed_download_url(body: &str, expected_hash: &str) -> Option<String> {
                 && href.contains(expected_hash)
         })?;
     Some(format!("https://libgen.li/{href}"))
+}
+
+fn alternate_cdn_url(url: &reqwest::Url) -> Option<String> {
+    let alternate = match url.host_str()? {
+        "cdn2.booksdl.lc" => "cdn3.booksdl.lc",
+        "cdn3.booksdl.lc" => "cdn2.booksdl.lc",
+        _ => return None,
+    };
+    let mut url = url.clone();
+    url.set_host(Some(alternate)).ok()?;
+    Some(url.to_string())
 }
 
 fn parse(body: &str, limit: usize) -> SearchResults {
@@ -367,6 +385,17 @@ mod tests {
         assert_eq!(
             keyed_download_url(&body, "00000000000000000000000000000000"),
             None
+        );
+    }
+
+    #[test]
+    fn switches_between_libgen_cdn_hosts_without_changing_the_key() {
+        let url = reqwest::Url::parse("https://cdn3.booksdl.lc/get.php?md5=abc&key=temporary-key")
+            .unwrap();
+
+        assert_eq!(
+            alternate_cdn_url(&url).as_deref(),
+            Some("https://cdn2.booksdl.lc/get.php?md5=abc&key=temporary-key")
         );
     }
 }

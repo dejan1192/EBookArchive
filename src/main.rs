@@ -6,13 +6,17 @@
 //! books, `d` downloads the marked ones. `/` returns to the search box.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Layout, Margin, Rect},
@@ -24,6 +28,7 @@ use ratatui::{
         ScrollbarState, Wrap,
     },
 };
+use serde::{Deserialize, Serialize};
 use throbber_widgets_tui::{BRAILLE_EIGHT_DOUBLE, Throbber, ThrobberState};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -36,6 +41,12 @@ mod theme;
 
 const DOWNLOAD_DIR: &str = "downloads";
 const TICK: Duration = Duration::from_millis(80);
+const RESULTS_PER_PAGE: usize = 50;
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Preferences {
+    disabled_sources: Vec<String>,
+}
 
 /// Work finished on a background task, on its way back to the UI.
 enum Msg {
@@ -108,6 +119,7 @@ struct App {
     rt: Handle,
     client: reqwest::Client,
     sources: Vec<SourceEntry>,
+    preferences_path: Option<PathBuf>,
     source_cursor: usize,
     tx: UnboundedSender<Msg>,
     rx: UnboundedReceiver<Msg>,
@@ -130,12 +142,21 @@ struct App {
     status: String,
     library: Vec<LibraryEntry>,
     library_selected: usize,
+    results_area: Rect,
+    results_offset: usize,
+    library_area: Rect,
+    library_offset: usize,
     exit: bool,
 }
 
 impl App {
     fn new(rt: Handle) -> Result<Self> {
         let (tx, rx) = unbounded_channel();
+        let preferences_path = preferences_path();
+        let preferences = preferences_path
+            .as_deref()
+            .and_then(|path| load_preferences(path).ok())
+            .unwrap_or_default();
         Ok(Self {
             rt,
             client: reqwest::Client::builder()
@@ -144,10 +165,14 @@ impl App {
             sources: source::all()
                 .into_iter()
                 .map(|source| SourceEntry {
+                    enabled: !preferences
+                        .disabled_sources
+                        .iter()
+                        .any(|name| name == source.name()),
                     source,
-                    enabled: true,
                 })
                 .collect(),
+            preferences_path,
             source_cursor: 0,
             tx,
             rx,
@@ -166,6 +191,10 @@ impl App {
             status: "type a title or author, then press Enter".to_string(),
             library: Vec::new(),
             library_selected: 0,
+            results_area: Rect::default(),
+            results_offset: 0,
+            library_area: Rect::default(),
+            library_offset: 0,
             exit: false,
         })
     }
@@ -201,6 +230,10 @@ impl App {
     // ---- input -----------------------------------------------------------
 
     fn handle_event(&mut self, ev: &Event) {
+        if let Event::Mouse(mouse) = ev {
+            self.handle_mouse(*mouse);
+            return;
+        }
         let Event::Key(key) = ev else { return };
         if key.kind != KeyEventKind::Press {
             return;
@@ -266,6 +299,9 @@ impl App {
                     if let Some(entry) = self.sources.get_mut(self.source_cursor) {
                         entry.enabled = !entry.enabled;
                     }
+                    if let Err(error) = self.save_preferences() {
+                        self.status = format!("could not save source settings: {error}");
+                    }
                 }
                 KeyCode::Char('q') => self.exit = true,
                 _ => {}
@@ -279,6 +315,51 @@ impl App {
                 KeyCode::Char('r') => self.open_library(),
                 _ => {}
             },
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => match self.mode {
+                Mode::Library => self.step_library_clamped(3),
+                Mode::Browse | Mode::Search if !self.entries.is_empty() => {
+                    self.mode = Mode::Browse;
+                    self.step_clamped(3);
+                }
+                _ => {}
+            },
+            MouseEventKind::ScrollUp => match self.mode {
+                Mode::Library => self.step_library_clamped(-3),
+                Mode::Browse | Mode::Search if !self.entries.is_empty() => {
+                    self.mode = Mode::Browse;
+                    self.step_clamped(-3);
+                }
+                _ => {}
+            },
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.mode == Mode::Library {
+                    if let Some(index) = clicked_row(
+                        mouse.column,
+                        mouse.row,
+                        self.library_area,
+                        self.library_offset,
+                        self.library.len(),
+                    ) {
+                        self.library_selected = index;
+                    }
+                } else if let Some(index) = clicked_row(
+                    mouse.column,
+                    mouse.row,
+                    self.results_area,
+                    self.results_offset,
+                    self.entries.len(),
+                ) {
+                    self.mode = Mode::Browse;
+                    self.selected = index;
+                    self.toggle();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -318,6 +399,10 @@ impl App {
             .rem_euclid(self.library.len() as isize) as usize;
     }
 
+    fn step_library_clamped(&mut self, delta: isize) {
+        self.library_selected = clamped_index(self.library_selected, delta, self.library.len());
+    }
+
     fn open_library_selected(&mut self) {
         let Some(entry) = self.library.get(self.library_selected) else {
             return;
@@ -337,6 +422,10 @@ impl App {
         self.selected = next as usize;
     }
 
+    fn step_clamped(&mut self, delta: isize) {
+        self.selected = clamped_index(self.selected, delta, self.entries.len());
+    }
+
     fn toggle(&mut self) {
         if let Some(entry) = self.entries.get_mut(self.selected) {
             entry.marked = !entry.marked;
@@ -348,6 +437,20 @@ impl App {
             self.mode_before_sources = self.mode;
             self.mode = Mode::Sources;
         }
+    }
+
+    fn save_preferences(&self) -> Result<()> {
+        let Some(path) = &self.preferences_path else {
+            return Ok(());
+        };
+        let mut disabled_sources = self
+            .sources
+            .iter()
+            .filter(|entry| !entry.enabled)
+            .map(|entry| entry.source.name().to_string())
+            .collect::<Vec<_>>();
+        disabled_sources.sort();
+        save_preferences(path, &Preferences { disabled_sources })
     }
 
     // ---- background work -------------------------------------------------
@@ -405,7 +508,7 @@ impl App {
             let query = query.clone();
             self.rt.spawn(async move {
                 let result = src
-                    .search(&client, &query, page, 25)
+                    .search(&client, &query, page, RESULTS_PER_PAGE)
                     .await
                     .map_err(|e| e.to_string());
                 let _ = tx.send(Msg::Results {
@@ -529,6 +632,7 @@ impl App {
                         Err(error) => self.status = format!("{source}: {error}"),
                     }
                     if self.pending == 0 {
+                        self.entries.truncate(RESULTS_PER_PAGE);
                         self.total_pages = self.exact_total_pages();
                         if self.entries.is_empty()
                             && self.total_pages.is_some_and(|total| self.page > total)
@@ -539,13 +643,21 @@ impl App {
                         }
                         self.status = match self.entries.len() {
                             0 => "no results".to_string(),
-                            n => format!(
-                                "{n} result(s) — page {}{} — Space marks, d downloads",
-                                self.page,
-                                self.total_pages
-                                    .map(|total| format!("/{total}"))
-                                    .unwrap_or_default()
-                            ),
+                            n => {
+                                let more = if n == RESULTS_PER_PAGE {
+                                    " — n for next page"
+                                } else {
+                                    ""
+                                };
+                                format!(
+                                    "{n}/{RESULTS_PER_PAGE} results — page {}{}{} — Space marks, d downloads",
+                                    self.page,
+                                    self.total_pages
+                                        .map(|total| format!("/{total}"))
+                                        .unwrap_or_default(),
+                                    more,
+                                )
+                            }
                         };
                         if !self.entries.is_empty() && self.mode == Mode::Search {
                             self.mode = Mode::Browse;
@@ -573,6 +685,7 @@ impl App {
                         && let Some(entry) = self.entries.get_mut(idx)
                     {
                         entry.status = Status::Done(path);
+                        entry.marked = false;
                     }
                 }
                 Msg::Failed {
@@ -693,6 +806,7 @@ impl App {
     }
 
     fn draw_results(&mut self, frame: &mut Frame, area: Rect) {
+        self.results_area = area;
         let block = Block::bordered()
             .border_set(border::ROUNDED)
             .border_style(Style::new().fg(theme::FAINT))
@@ -736,6 +850,7 @@ impl App {
             .highlight_style(Style::new().bg(theme::SELECTION_BG).bold());
         let mut state = ListState::default().with_selected(Some(self.selected));
         frame.render_stateful_widget(list, area, &mut state);
+        self.results_offset = state.offset();
 
         self.draw_scrollbar(frame, area, self.entries.len(), self.selected);
     }
@@ -884,6 +999,7 @@ impl App {
             Constraint::Min(0),
         ])
         .areas(frame.area());
+        self.library_area = list_area;
         self.draw_tabs(frame, tabs_area, true);
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -943,6 +1059,7 @@ impl App {
             .highlight_style(Style::new().bg(theme::SELECTION_BG).bold());
         let mut state = ListState::default().with_selected(Some(self.library_selected));
         frame.render_stateful_widget(list, list_area, &mut state);
+        self.library_offset = state.offset();
 
         self.draw_scrollbar(frame, list_area, self.library.len(), self.library_selected);
     }
@@ -1139,6 +1256,25 @@ fn is_ebook(path: &Path) -> bool {
         })
 }
 
+fn clicked_row(column: u16, row: u16, area: Rect, offset: usize, len: usize) -> Option<usize> {
+    let inside = column > area.x
+        && column < area.x.saturating_add(area.width).saturating_sub(1)
+        && row > area.y
+        && row < area.y.saturating_add(area.height).saturating_sub(1);
+    if !inside {
+        return None;
+    }
+    let index = offset + usize::from(row - area.y - 1);
+    (index < len).then_some(index)
+}
+
+fn clamped_index(current: usize, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    current.saturating_add_signed(delta).min(len - 1)
+}
+
 fn launch_reader(path: &Path) -> Result<String> {
     let mut readers = std::env::var("TUI_BOOK_READER")
         .ok()
@@ -1184,12 +1320,40 @@ fn human_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
+fn preferences_path() -> Option<PathBuf> {
+    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(config).join("tui-book-search/preferences.json"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config/tui-book-search/preferences.json"))
+}
+
+fn load_preferences(path: &Path) -> Result<Preferences> {
+    let contents = fs::read(path)?;
+    Ok(serde_json::from_slice(&contents)?)
+}
+
+fn save_preferences(path: &Path, preferences: &Preferences) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(preferences)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let mut app = App::new(runtime.handle().clone())?;
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
     let result = ratatui::run(|terminal| app.run(terminal));
+    let mouse_result = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     runtime.block_on(app.close_sources());
-    result
+    result?;
+    mouse_result?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1290,6 +1454,88 @@ mod tests {
         assert!(rendered.contains("Marsovac.epub"));
         assert!(rendered.contains("EPUB"));
         assert!(rendered.contains("374.9 kB"));
+    }
+
+    #[test]
+    fn successful_download_clears_the_mark() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = App::new(rt.handle().clone()).unwrap();
+        app.entries.push(Entry {
+            book: book("Marsovac", "Andy Weir"),
+            marked: true,
+            status: Status::Queued,
+            started: Some(Instant::now()),
+        });
+        app.tx
+            .send(Msg::Done {
+                generation: app.generation,
+                idx: 0,
+                path: PathBuf::from("downloads/Marsovac.epub"),
+            })
+            .unwrap();
+
+        app.drain();
+
+        assert!(!app.entries[0].marked);
+        assert!(matches!(app.entries[0].status, Status::Done(_)));
+    }
+
+    #[test]
+    fn mouse_click_selects_and_marks_a_result() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = App::new(rt.handle().clone()).unwrap();
+        app.mode = Mode::Browse;
+        app.entries = vec![
+            Entry {
+                book: book("First", "Author"),
+                marked: false,
+                status: Status::Idle,
+                started: None,
+            },
+            Entry {
+                book: book("Second", "Author"),
+                marked: false,
+                status: Status::Idle,
+                started: None,
+            },
+        ];
+        app.results_area = Rect::new(0, 4, 80, 8);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.selected, 1);
+        assert!(app.entries[1].marked);
+        assert!(!app.entries[0].marked);
+    }
+
+    #[test]
+    fn mouse_scroll_stops_at_list_edges() {
+        assert_eq!(clamped_index(0, -3, 10), 0);
+        assert_eq!(clamped_index(8, 3, 10), 9);
+        assert_eq!(clamped_index(9, 3, 10), 9);
+        assert_eq!(clamped_index(0, 3, 0), 0);
+    }
+
+    #[test]
+    fn saves_and_loads_disabled_sources() {
+        let path = std::env::temp_dir().join(format!(
+            "tui-book-search-preferences-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let expected = Preferences {
+            disabled_sources: vec!["annas-archive".into(), "libgen".into()],
+        };
+
+        save_preferences(&path, &expected).unwrap();
+        let loaded = load_preferences(&path).unwrap();
+
+        assert_eq!(loaded.disabled_sources, expected.disabled_sources);
+        let _ = fs::remove_file(path);
     }
 
     /// Both lists have to say something useful when they have nothing to show.
