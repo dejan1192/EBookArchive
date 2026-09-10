@@ -358,8 +358,8 @@ impl App {
                 KeyCode::Enter => {
                     self.commit_settings();
                 }
-                KeyCode::Up | KeyCode::Char('k') => self.settings_cursor = 0,
-                KeyCode::Down | KeyCode::Char('j') => self.settings_cursor = 1,
+                KeyCode::Up => self.settings_cursor = 0,
+                KeyCode::Down => self.settings_cursor = 1,
                 KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.exit = true
                 }
@@ -1890,6 +1890,25 @@ mod tests {
         assert!(rendered.contains("Google Drive remote"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_text_fields_accept_vim_navigation_letters() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = App::new(rt.handle().clone()).unwrap();
+        app.mode = Mode::Settings;
+        app.settings_cursor = 0;
+        app.download_dir_input = Input::default();
+
+        for character in "ebook".chars() {
+            app.handle_event(&Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )));
+        }
+
+        assert_eq!(app.download_dir_input.value(), "ebook");
+        assert_eq!(app.settings_cursor, 0);
     }
 
     #[test]
