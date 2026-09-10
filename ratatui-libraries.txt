@@ -1,0 +1,73 @@
+Ratatui ecosystem libraries
+===========================
+Checked 2026-09-09 against this project: ratatui 0.30.2, crossterm 0.29.0.
+Versions are what crates.io served that day. All entries below resolve
+cleanly on ratatui 0.30.2 unless noted.
+
+COMPATIBILITY WARNING
+---------------------
+ratatui 0.30 split the crate into ratatui-core / ratatui-widgets, so a
+third-party widget needs a release that targets 0.30. If it doesn't, cargo
+quietly resolves TWO copies of ratatui and the widget's types won't unify
+with your Buffer.
+
+  After adding any widget crate, run:  cargo tree -i ratatui
+  If it answers "specification `ratatui` is ambiguous", you have two
+  versions and it will not work.
+
+  KNOWN BAD: tui-textarea 0.7.0  -- pins ratatui ^0.29. Do not use on 0.30.
+
+
+RECOMMENDED FIRST
+-----------------
+color-eyre            0.6.5    Panic hook that restores the terminal before
+                               printing. Without it a panic leaves your shell
+                               in raw mode with no echo. Add this one first.
+tui-input             0.15.4   Single-line text input: cursor, unicode,
+                               scrolling. The search-field building block.
+tui-prompts           0.6.7    Higher level than tui-input -- ready-made
+                               text/password/confirm prompts with focus.
+
+
+WIDGETS THAT FILL GAPS IN CORE
+------------------------------
+tui-scrollview        0.6.7    Scrollable viewport for over-tall content.
+tui-tree-widget       0.24.1   Collapsible tree view.
+tui-widget-list       0.15.3   List whose items are arbitrary widgets.
+tui-popup             0.7.6    Modal overlays.
+tui-menu              0.3.1    Dropdown menus.
+throbber-widgets-tui  0.11.1   Spinners for in-flight work.
+tui-big-text          0.8.9    Banner-size text for splash screens.
+tui-logger            0.18.3   Live log pane, wired to the `log` crate.
+
+
+CONTENT RENDERING
+-----------------
+ansi-to-tui           8.0.1    ANSI-colored output (e.g. from a subprocess)
+                               into styled ratatui Text.
+tui-markdown          0.3.9    Markdown -> Text.
+ratatui-image         11.0.8   Real images: sixel, kitty, iterm2, with a
+                               unicode half-block fallback.
+tui-term              0.3.4    Embed a full pseudo-terminal in a pane.
+
+
+BEYOND WIDGETS
+--------------
+tokio                          Plus crossterm's "event-stream" feature. Needed
+                               the moment you must do work while waiting for
+                               input -- the blocking event::read() loop can't.
+                               EventStream gives events as an async stream.
+unicode-width         0.2.2    Display width vs char count; required for
+                               correct cursor placement with CJK/emoji.
+                               Already in the tree via ratatui.
+insta                 1.48.0   Snapshot testing. Pairs well with ratatui's
+                               TestBackend: render to a buffer, snapshot the
+                               text, and layout regressions show as diffs.
+tuirealm              4.1.0    NOTE: crate name has no hyphens. React/Elm-style
+                               component framework on top of ratatui. Adopt at
+                               project start, not midway.
+
+
+EFFECTS
+-------
+tachyonfx             0.25.2   Shader-like transitions and animations.
