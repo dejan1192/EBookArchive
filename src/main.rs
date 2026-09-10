@@ -39,13 +39,32 @@ use tui::source::{self, Book, Format, SearchResults, Source};
 
 mod theme;
 
-const DOWNLOAD_DIR: &str = "downloads";
+const DEFAULT_DOWNLOAD_DIR: &str = "downloads";
 const TICK: Duration = Duration::from_millis(80);
 const RESULTS_PER_PAGE: usize = 50;
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Preferences {
+    #[serde(default)]
     disabled_sources: Vec<String>,
+    #[serde(default = "default_download_dir")]
+    download_dir: String,
+    #[serde(default)]
+    google_drive_remote: String,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            disabled_sources: Vec::new(),
+            download_dir: default_download_dir(),
+            google_drive_remote: String::new(),
+        }
+    }
+}
+
+fn default_download_dir() -> String {
+    DEFAULT_DOWNLOAD_DIR.to_string()
 }
 
 /// Work finished on a background task, on its way back to the UI.
@@ -61,10 +80,15 @@ enum Msg {
         seen: u64,
         total: Option<u64>,
     },
+    Uploading {
+        generation: u64,
+        idx: usize,
+    },
     Done {
         generation: u64,
         idx: usize,
         path: PathBuf,
+        drive: Option<Result<String, String>>,
     },
     Failed {
         generation: u64,
@@ -82,6 +106,7 @@ enum Status {
         seen: u64,
         total: Option<u64>,
     },
+    Uploading,
     Done(PathBuf),
     Failed(String),
 }
@@ -102,6 +127,8 @@ enum Mode {
     Sources,
     /// Browsing books already present in the download directory.
     Library,
+    /// Editing persistent storage settings.
+    Settings,
 }
 
 struct LibraryEntry {
@@ -146,6 +173,10 @@ struct App {
     results_offset: usize,
     library_area: Rect,
     library_offset: usize,
+    download_dir_input: Input,
+    drive_remote_input: Input,
+    settings_cursor: usize,
+    rclone_available: bool,
     exit: bool,
 }
 
@@ -195,6 +226,10 @@ impl App {
             results_offset: 0,
             library_area: Rect::default(),
             library_offset: 0,
+            download_dir_input: Input::from(preferences.download_dir),
+            drive_remote_input: Input::from(preferences.google_drive_remote),
+            settings_cursor: 0,
+            rclone_available: command_available("rclone"),
             exit: false,
         })
     }
@@ -248,13 +283,12 @@ impl App {
             self.open_sources();
             return;
         }
+        if key.code == KeyCode::F(3) {
+            self.open_settings();
+            return;
+        }
         if key.code == KeyCode::Tab && self.mode != Mode::Sources {
-            if self.mode == Mode::Library {
-                self.mode = Mode::Search;
-                self.status = "type a title or author, then press Enter".to_string();
-            } else {
-                self.open_library();
-            }
+            self.next_tab();
             return;
         }
 
@@ -315,6 +349,75 @@ impl App {
                 KeyCode::Char('r') => self.open_library(),
                 _ => {}
             },
+            Mode::Settings => match key.code {
+                KeyCode::Esc => {
+                    if self.commit_settings() {
+                        self.mode = Mode::Search;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.commit_settings();
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.settings_cursor = 0,
+                KeyCode::Down | KeyCode::Char('j') => self.settings_cursor = 1,
+                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.exit = true
+                }
+                _ => {
+                    if self.settings_cursor == 0 {
+                        self.download_dir_input.handle_event(ev);
+                    } else {
+                        self.drive_remote_input.handle_event(ev);
+                    }
+                }
+            },
+        }
+    }
+
+    fn next_tab(&mut self) {
+        match self.mode {
+            Mode::Library => self.open_settings(),
+            Mode::Settings => {
+                if self.commit_settings() {
+                    self.mode = Mode::Search;
+                    self.status = "type a title or author, then press Enter".to_string();
+                }
+            }
+            _ => self.open_library(),
+        }
+    }
+
+    fn open_settings(&mut self) {
+        self.mode = Mode::Settings;
+        self.status = "edit a field, then press Enter to save".to_string();
+    }
+
+    fn commit_settings(&mut self) -> bool {
+        let directory = self.download_dir_input.value().trim();
+        if directory.is_empty() {
+            self.status = "download folder cannot be empty".to_string();
+            return false;
+        }
+        let directory = expand_tilde(directory);
+        if let Err(error) = fs::create_dir_all(&directory) {
+            self.status = format!("could not create {}: {error}", directory.display());
+            return false;
+        }
+        let drive = self.drive_remote_input.value().trim();
+        if !drive.is_empty() && !drive.contains(':') {
+            self.status = "Google Drive remote must look like gdrive:EBookArchive".to_string();
+            return false;
+        }
+        self.download_dir_input = Input::from(directory.to_string_lossy().into_owned());
+        match self.save_preferences() {
+            Ok(()) => {
+                self.status = "settings saved".to_string();
+                true
+            }
+            Err(error) => {
+                self.status = format!("could not save settings: {error}");
+                false
+            }
         }
     }
 
@@ -380,12 +483,13 @@ impl App {
 
     fn open_library(&mut self) {
         self.mode = Mode::Library;
-        self.library = scan_library(Path::new(DOWNLOAD_DIR));
+        let directory = self.download_dir();
+        self.library = scan_library(&directory);
         self.library_selected = self
             .library_selected
             .min(self.library.len().saturating_sub(1));
         self.status = match self.library.len() {
-            0 => format!("no ebooks in {DOWNLOAD_DIR}/"),
+            0 => format!("no ebooks in {}", directory.display()),
             1 => "1 downloaded book".to_string(),
             count => format!("{count} downloaded books"),
         };
@@ -450,7 +554,18 @@ impl App {
             .map(|entry| entry.source.name().to_string())
             .collect::<Vec<_>>();
         disabled_sources.sort();
-        save_preferences(path, &Preferences { disabled_sources })
+        save_preferences(
+            path,
+            &Preferences {
+                disabled_sources,
+                download_dir: self.download_dir_input.value().trim().to_string(),
+                google_drive_remote: self.drive_remote_input.value().trim().to_string(),
+            },
+        )
+    }
+
+    fn download_dir(&self) -> PathBuf {
+        expand_tilde(self.download_dir_input.value().trim())
     }
 
     // ---- background work -------------------------------------------------
@@ -564,35 +679,46 @@ impl App {
 
         let generation = self.generation;
         let started = jobs.len();
+        let dest_dir = self.download_dir();
+        let drive_remote = self.drive_remote_input.value().trim().to_string();
         for (idx, book, download, src) in jobs {
             self.entries[idx].status = Status::Queued;
             self.entries[idx].started = Some(Instant::now());
             let client = self.client.clone();
             let tx = self.tx.clone();
+            let dest_dir = dest_dir.clone();
+            let drive_remote = drive_remote.clone();
             self.rt.spawn(async move {
                 let progress_tx = tx.clone();
                 let result = src
-                    .fetch(
-                        &client,
-                        &book,
-                        &download,
-                        Path::new(DOWNLOAD_DIR),
-                        &move |seen, total| {
-                            let _ = progress_tx.send(Msg::Progress {
-                                generation,
-                                idx,
-                                seen,
-                                total,
-                            });
-                        },
-                    )
+                    .fetch(&client, &book, &download, &dest_dir, &move |seen, total| {
+                        let _ = progress_tx.send(Msg::Progress {
+                            generation,
+                            idx,
+                            seen,
+                            total,
+                        });
+                    })
                     .await;
                 let _ = match result {
-                    Ok(path) => tx.send(Msg::Done {
-                        generation,
-                        idx,
-                        path,
-                    }),
+                    Ok(path) => {
+                        let drive = if drive_remote.is_empty() {
+                            None
+                        } else {
+                            let _ = tx.send(Msg::Uploading { generation, idx });
+                            Some(
+                                upload_to_google_drive(path.clone(), drive_remote)
+                                    .await
+                                    .map_err(|error| error.to_string()),
+                            )
+                        };
+                        tx.send(Msg::Done {
+                            generation,
+                            idx,
+                            path,
+                            drive,
+                        })
+                    }
                     Err(e) => tx.send(Msg::Failed {
                         generation,
                         idx,
@@ -601,7 +727,7 @@ impl App {
                 };
             });
         }
-        self.status = format!("downloading {started} file(s) into {DOWNLOAD_DIR}/");
+        self.status = format!("downloading {started} file(s) into {}", dest_dir.display());
     }
 
     fn drain(&mut self) {
@@ -676,16 +802,30 @@ impl App {
                         entry.status = Status::Downloading { seen, total };
                     }
                 }
+                Msg::Uploading { generation, idx } => {
+                    if generation == self.generation
+                        && let Some(entry) = self.entries.get_mut(idx)
+                    {
+                        entry.status = Status::Uploading;
+                    }
+                }
                 Msg::Done {
                     generation,
                     idx,
                     path,
+                    drive,
                 } => {
                     if generation == self.generation
                         && let Some(entry) = self.entries.get_mut(idx)
                     {
                         entry.status = Status::Done(path);
                         entry.marked = false;
+                        if let Some(result) = drive {
+                            self.status = match result {
+                                Ok(target) => format!("uploaded to Google Drive: {target}"),
+                                Err(error) => format!("saved locally; Google Drive: {error}"),
+                            };
+                        }
                     }
                 }
                 Msg::Failed {
@@ -710,6 +850,10 @@ impl App {
             self.draw_library(frame);
             return;
         }
+        if self.mode == Mode::Settings {
+            self.draw_settings(frame);
+            return;
+        }
 
         let [tabs_area, search_area, sources_area, status_area, list_area] = Layout::vertical([
             Constraint::Length(1),
@@ -720,7 +864,7 @@ impl App {
         ])
         .areas(frame.area());
 
-        self.draw_tabs(frame, tabs_area, false);
+        self.draw_tabs(frame, tabs_area, Mode::Search);
         self.draw_search_box(frame, search_area);
         self.draw_sources(frame, sources_area);
         self.draw_status(frame, status_area);
@@ -944,7 +1088,12 @@ impl App {
         let active = self
             .entries
             .iter()
-            .filter(|e| matches!(e.status, Status::Queued | Status::Downloading { .. }))
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    Status::Queued | Status::Downloading { .. } | Status::Uploading
+                )
+            })
             .count();
         (active > 0).then(|| match active {
             1 => "Downloading".to_string(),
@@ -961,7 +1110,7 @@ impl App {
             .unwrap_or(0)
     }
 
-    fn draw_tabs(&self, frame: &mut Frame, area: Rect, library: bool) {
+    fn draw_tabs(&self, frame: &mut Frame, area: Rect, active: Mode) {
         let [left_area, right_area] =
             Layout::horizontal([Constraint::Min(0), Constraint::Length(16)]).areas(area);
 
@@ -974,17 +1123,23 @@ impl App {
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                tab("Search", !library),
+                tab(
+                    "Search",
+                    matches!(active, Mode::Search | Mode::Browse | Mode::Sources),
+                ),
                 Span::raw(" "),
-                tab("Downloads", library),
+                tab("Downloads", active == Mode::Library),
+                Span::raw(" "),
+                tab("Settings", active == Mode::Settings),
                 theme::hint("   tab switches"),
             ])),
             left_area,
         );
 
-        let count = match library {
-            true => format!("{} on disk ", self.library.len()),
-            false => format!("{} found ", self.entries.len()),
+        let count = match active {
+            Mode::Library => format!("{} on disk ", self.library.len()),
+            Mode::Settings => "configuration ".to_string(),
+            _ => format!("{} found ", self.entries.len()),
         };
         frame.render_widget(
             Paragraph::new(theme::hint(&count)).alignment(Alignment::Right),
@@ -1000,7 +1155,7 @@ impl App {
         ])
         .areas(frame.area());
         self.library_area = list_area;
-        self.draw_tabs(frame, tabs_area, true);
+        self.draw_tabs(frame, tabs_area, Mode::Library);
         frame.render_widget(
             Paragraph::new(Span::styled(
                 self.status.clone(),
@@ -1062,6 +1217,97 @@ impl App {
         self.library_offset = state.offset();
 
         self.draw_scrollbar(frame, list_area, self.library.len(), self.library_selected);
+    }
+
+    fn draw_settings(&mut self, frame: &mut Frame) {
+        let [tabs_area, status_area, download_area, drive_area, help_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .areas(frame.area());
+        self.draw_tabs(frame, tabs_area, Mode::Settings);
+        self.draw_status(frame, status_area);
+        Self::draw_setting_input(
+            frame,
+            download_area,
+            " Download folder ",
+            &self.download_dir_input,
+            self.settings_cursor == 0,
+        );
+        Self::draw_setting_input(
+            frame,
+            drive_area,
+            " Google Drive remote (optional) ",
+            &self.drive_remote_input,
+            self.settings_cursor == 1,
+        );
+
+        let rclone = if self.rclone_available {
+            Span::styled("rclone is installed", Style::new().fg(theme::OK).bold())
+        } else {
+            Span::styled(
+                "rclone is not installed",
+                Style::new().fg(theme::ERR).bold(),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(vec![
+                    theme::hint("Drive target example: "),
+                    Span::styled("gdrive:EBookArchive", Style::new().fg(theme::BLUE)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    rclone,
+                    theme::hint(". Configure it with: rclone config"),
+                ]),
+                Line::from(""),
+                Line::from(theme::hint(
+                    "up/down chooses a field  •  Enter saves  •  Tab opens Search",
+                )),
+            ])
+            .block(
+                Block::bordered()
+                    .border_set(border::ROUNDED)
+                    .border_style(Style::new().fg(theme::FAINT))
+                    .title(Span::styled(
+                        " Storage ",
+                        Style::new().fg(theme::ACCENT).bold(),
+                    )),
+            )
+            .wrap(Wrap { trim: true }),
+            help_area,
+        );
+    }
+
+    fn draw_setting_input(
+        frame: &mut Frame,
+        area: Rect,
+        title: &'static str,
+        input: &Input,
+        focused: bool,
+    ) {
+        let color = if focused { theme::ACCENT } else { theme::FAINT };
+        let block = Block::bordered()
+            .border_set(border::ROUNDED)
+            .border_style(Style::new().fg(color))
+            .title(Span::styled(title, Style::new().fg(color).bold()));
+        let inner = block.inner(area);
+        let width = inner.width.max(1) as usize;
+        let scroll = input.visual_scroll(width.saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new(input.value())
+                .scroll((0, scroll as u16))
+                .block(block),
+            area,
+        );
+        if focused {
+            let x = input.visual_cursor().saturating_sub(scroll) as u16;
+            frame.set_cursor_position((inner.x + x, inner.y));
+        }
     }
 
     /// Filename on the left, format and size lined up on the right.
@@ -1195,6 +1441,10 @@ impl App {
                 }
                 spans
             }
+            Status::Uploading => vec![
+                self.spin(Style::new().fg(theme::BLUE)),
+                Span::styled(" uploading to Drive", Style::new().fg(theme::BLUE)),
+            ],
             Status::Done(path) => vec![Span::styled(
                 format!(
                     "✓ {}",
@@ -1273,6 +1523,63 @@ fn clamped_index(current: usize, delta: isize, len: usize) -> usize {
         return 0;
     }
     current.saturating_add_signed(delta).min(len - 1)
+}
+
+fn expand_tilde(value: &str) -> PathBuf {
+    if value == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(value)
+}
+
+fn command_available(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| directory.join(name).is_file())
+    })
+}
+
+async fn upload_to_google_drive(path: PathBuf, remote: String) -> Result<String> {
+    let target = google_drive_target(&path, &remote)?;
+    let command_target = target.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("rclone")
+            .arg("copyto")
+            .arg("--")
+            .arg(path)
+            .arg(command_target)
+            .output()
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("could not run rclone: {error}"))?
+    .map_err(|error| anyhow::anyhow!("rclone is not installed: {error}"))?;
+
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        anyhow::bail!("rclone failed: {error}");
+    }
+    Ok(target)
+}
+
+fn google_drive_target(path: &Path, remote: &str) -> Result<String> {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("downloaded filename is not valid UTF-8"))?;
+    let remote = remote.trim().trim_end_matches('/');
+    if remote.is_empty() {
+        anyhow::bail!("Google Drive remote is empty");
+    }
+    Ok(format!("{remote}/{filename}"))
 }
 
 fn launch_reader(path: &Path) -> Result<String> {
@@ -1471,6 +1778,7 @@ mod tests {
                 generation: app.generation,
                 idx: 0,
                 path: PathBuf::from("downloads/Marsovac.epub"),
+                drive: None,
             })
             .unwrap();
 
@@ -1529,13 +1837,67 @@ mod tests {
         ));
         let expected = Preferences {
             disabled_sources: vec!["annas-archive".into(), "libgen".into()],
+            download_dir: "/tmp/ebooks".into(),
+            google_drive_remote: "gdrive:EBookArchive".into(),
         };
 
         save_preferences(&path, &expected).unwrap();
         let loaded = load_preferences(&path).unwrap();
 
         assert_eq!(loaded.disabled_sources, expected.disabled_sources);
+        assert_eq!(loaded.download_dir, expected.download_dir);
+        assert_eq!(loaded.google_drive_remote, expected.google_drive_remote);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn old_preferences_keep_default_storage_settings() {
+        let loaded: Preferences =
+            serde_json::from_str(r#"{"disabled_sources":["libgen"]}"#).unwrap();
+
+        assert_eq!(loaded.download_dir, DEFAULT_DOWNLOAD_DIR);
+        assert!(loaded.google_drive_remote.is_empty());
+    }
+
+    #[test]
+    fn settings_page_saves_download_folder_and_drive_remote() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-book-settings-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let preferences = root.join("preferences.json");
+        let downloads = root.join("my-books");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = App::new(rt.handle().clone()).unwrap();
+        app.preferences_path = Some(preferences.clone());
+        app.download_dir_input = Input::from(downloads.to_string_lossy().into_owned());
+        app.drive_remote_input = Input::from("gdrive:EBookArchive");
+
+        app.commit_settings();
+
+        let saved = load_preferences(&preferences).unwrap();
+        assert_eq!(saved.download_dir, downloads.to_string_lossy());
+        assert_eq!(saved.google_drive_remote, "gdrive:EBookArchive");
+        assert!(downloads.is_dir());
+
+        app.mode = Mode::Settings;
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Settings"));
+        assert!(rendered.contains("Download folder"));
+        assert!(rendered.contains("Google Drive remote"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_google_drive_destination_without_changing_filename() {
+        assert_eq!(
+            google_drive_target(Path::new("/tmp/Marsovac.epub"), "gdrive:EBookArchive/").unwrap(),
+            "gdrive:EBookArchive/Marsovac.epub"
+        );
     }
 
     /// Both lists have to say something useful when they have nothing to show.
